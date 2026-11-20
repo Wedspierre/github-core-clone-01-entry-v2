@@ -1,8 +1,8 @@
-# github-core-clone-01-entry-2
+# github-core-clone-01-entry
 
 [![competition](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01)
-[![rank](https://make.fun/badge/github-core-clone-01/Wedspierre/github-core-clone-01-entry-2/rank.svg)](https://make.fun/bounty/github-core-clone-01)
-[![reward](https://make.fun/badge/github-core-clone-01/Wedspierre/github-core-clone-01-entry-2/reward.svg)](https://make.fun/bounty/github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/Wedspierre/github-core-clone-01-entry/rank.svg)](https://make.fun/bounty/github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/Wedspierre/github-core-clone-01-entry/reward.svg)](https://make.fun/bounty/github-core-clone-01)
 
 A GitHub-compatible git forge in a single dependency-free Node 22 process,
 built for the [github-core-clone-01 bounty](https://make.fun/bounty/github-core-clone-01).
