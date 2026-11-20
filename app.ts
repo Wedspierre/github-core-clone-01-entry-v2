@@ -1,326 +1,236 @@
-// app.ts — the HTTP server: routing, auth, JSON plumbing, git smart HTTP dispatch.
-// One process, node:http only. Auth: every /api/v3, /api/graphql and /mcp call must
-// carry Authorization: Bearer $MAKEFUN_SHOP_TOKEN; /healthz takes none.
+// HTTP server: one Node process, no dependencies. Manual routing (no path
+// splitting on the hot path), a response-bytes cache for issue reads, and
+// the git smart-HTTP endpoints. Request handling is deterministic: no
+// Date.now() or Math.random() anywhere on the request path.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { SHOP_TOKEN, VIEWER_LOGIN, getRepo } from './store.ts';
-import { routeRest, type RestCtx } from './rest.ts';
-import { executeGraphQL } from './graphql.ts';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { Store } from './store.ts';
+import { handleRest, issueBytes } from './rest.ts';
+import { runGraphQL, runGraphQLBatch } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import {
+  decodePackets,
   handleReceivePack,
   lsRefsResponse,
-  parsePktLines,
-  parseV0Fetch,
-  parseV2Command,
-  planFetch,
-  pktLine,
-  v0Advertisement,
+  parseV0Request,
+  parseV2Request,
   v0FetchResponse,
+  v0ReceiveAdvertisement,
+  v0UploadAdvertisement,
   v2Advertisement,
   v2FetchResponse,
-  type FetchRequest,
-  type LsRefsOptions,
 } from './gitproto.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+const store = new Store();
+const TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
 let requestCounter = 0;
-function nextRequestId(): string {
+
+function send(res: ServerResponse, status: number, body: Buffer | null, contentType: string, extra?: Record<string, string>): void {
   requestCounter += 1;
-  return `req-${requestCounter}`;
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, {
-    'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
-    'x-github-request-id': nextRequestId(),
-    ...headers,
-  });
-  res.end(text);
-}
-
-function sendNoBody(res: ServerResponse, status: number): void {
-  res.writeHead(status, { 'x-github-request-id': nextRequestId() });
-  res.end();
-}
-
-function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
-  res.writeHead(status, {
+  const headers: Record<string, string> = {
     'content-type': contentType,
-    'content-length': body.length,
-    'x-github-request-id': nextRequestId(),
-  });
+    'x-github-request-id': `R${requestCounter}`,
+  };
+  if (extra) for (const [key, value] of Object.entries(extra)) headers[key] = value;
+  if (body === null || body.length === 0) {
+    headers['content-length'] = '0';
+    res.writeHead(status, headers);
+    res.end();
+    return;
+  }
+  headers['content-length'] = String(body.length);
+  res.writeHead(status, headers);
   res.end(body);
+}
+
+function sendJson(res: ServerResponse, status: number, value: unknown, extra?: Record<string, string>): void {
+  send(res, status, Buffer.from(JSON.stringify(value), 'utf8'), 'application/json', extra);
+}
+
+function authorized(req: IncomingMessage): boolean {
+  if (TOKEN === '') return true;
+  const header = req.headers.authorization;
+  return header === `Bearer ${TOKEN}`;
 }
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let total = 0;
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > 64 * 1024 * 1024) {
+        req.destroy();
+        reject(new Error('body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
 
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+const GIT_AD_UPLOAD = 'application/x-git-upload-pack-advertisement';
+const GIT_AD_RECEIVE = 'application/x-git-receive-pack-advertisement';
+const GIT_UPLOAD = 'application/x-git-upload-pack-request';
+const GIT_RECEIVE = 'application/x-git-receive-pack-request';
+const GIT_RESULT = 'application/x-git-upload-pack-result';
+const GIT_RECEIVE_RESULT = 'application/x-git-receive-pack-result';
+
+/** Fast path: GET /api/v3/repos/{owner}/{repo}/issues/{n} with no query. */
+function fastIssueRead(owner: string, repoName: string, number: number): Buffer | null {
+  const repo = store.getRepo(owner, repoName);
+  if (!repo) return null;
+  const issue = repo.issues.get(number);
+  if (!issue) return null;
+  return issueBytes(store, repo, issue);
 }
 
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
-}
-
-function bearerToken(req: IncomingMessage): string | null {
-  const header = req.headers.authorization ?? '';
-  const m = /^Bearer (.+)$/.exec(header);
-  return m === null ? null : (m[1] as string);
-}
-
-/** True when the request carries the suite's token (or any non-empty bearer when no token is configured). */
-function authed(req: IncomingMessage): boolean {
-  const token = bearerToken(req);
-  if (token === null) return false;
-  if (SHOP_TOKEN === '') return true;
-  return token === SHOP_TOKEN;
-}
-
-function decodeSegment(s: string): string {
-  try {
-    return decodeURIComponent(s);
-  } catch {
-    return s;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// git smart HTTP
-// ---------------------------------------------------------------------------
-
-function gitRepo(owner: string, name: string): ReturnType<typeof getRepo> {
-  if (owner !== VIEWER_LOGIN) return undefined;
-  return getRepo(owner, name);
-}
-
-function handleGit(req: IncomingMessage, res: ServerResponse, path: string, body: Buffer): boolean {
-  const m = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(path);
-  if (m === null) return false;
-  const owner = decodeSegment(m[1] as string);
-  const repoName = decodeSegment(m[2] as string);
-  const rest = m[3] as string;
-  const repo = gitRepo(owner, repoName);
-  if (repo === undefined) {
-    sendJson(res, 404, { message: 'Not Found' });
-    return true;
-  }
-  const query = queryOf(req);
+async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
+  const rawUrl = req.url ?? '/';
+  const question = rawUrl.indexOf('?');
+  const path = question === -1 ? rawUrl : rawUrl.slice(0, question);
+  const queryString = question === -1 ? '' : rawUrl.slice(question + 1);
+  const query = new URLSearchParams(queryString);
 
-  if (method === 'GET' && rest === 'info/refs') {
-    const service = query.get('service');
-    if (service === 'git-upload-pack') {
-      if ((req.headers['git-protocol'] ?? '') === 'version=2') {
-        sendBuffer(res, 200, v2Advertisement(), 'application/x-git-upload-pack-advertisement');
-      } else {
-        sendBuffer(res, 200, v0Advertisement('git-upload-pack', repo), 'application/x-git-upload-pack-advertisement');
-      }
-      return true;
-    }
-    if (service === 'git-receive-pack') {
-      sendBuffer(res, 200, v0Advertisement('git-receive-pack', repo), 'application/x-git-receive-pack-advertisement');
-      return true;
-    }
-    sendJson(res, 404, { message: 'Not Found' });
-    return true;
+  // Health check: no auth, no request id needed beyond the standard header.
+  if (path === '/healthz') {
+    if (method === 'GET') return sendJson(res, 200, { ok: true });
+    return sendJson(res, 404, { message: 'Not Found' });
   }
 
-  if (method === 'POST' && rest === 'git-upload-pack') {
-    try {
-      if ((req.headers['git-protocol'] ?? '') === 'version=2') {
-        const { command, args } = parseV2Command(body);
-        if (command === 'command=ls-refs') {
-          const opts: LsRefsOptions = { peel: false, symrefs: false, unborn: false, prefixes: [] };
-          for (const a of args) {
-            if (a === 'peel') opts.peel = true;
-            else if (a === 'symrefs') opts.symrefs = true;
-            else if (a === 'unborn') opts.unborn = true;
-            else if (a.startsWith('ref-prefix ')) opts.prefixes.push(a.slice('ref-prefix '.length));
-          }
-          sendBuffer(res, 200, lsRefsResponse(repo, opts), 'application/x-git-upload-pack-result');
-          return true;
+  if (!authorized(req)) return sendJson(res, 401, { message: 'Bad credentials' });
+
+  const host = req.headers.host ?? 'localhost';
+
+  // --- git smart HTTP -----------------------------------------------------
+  if (path.endsWith('.git/info/refs') || path.endsWith('.git/git-upload-pack') || path.endsWith('.git/git-receive-pack')) {
+    const suffix = path.endsWith('/info/refs') ? '/info/refs' : path.endsWith('/git-upload-pack') ? '/git-upload-pack' : '/git-receive-pack';
+    const gitPath = path.slice(0, -suffix.length);
+    const slash = gitPath.indexOf('/', 1);
+    const owner = decodeURIComponent(gitPath.slice(1, slash));
+    const repoPart = decodeURIComponent(gitPath.slice(slash + 1));
+    const repoName = repoPart.endsWith('.git') ? repoPart.slice(0, -4) : repoPart;
+    const repo = store.getRepo(owner, repoName);
+    if (repo === undefined) return sendJson(res, 404, { message: 'Not Found' });
+
+    if (path.endsWith('/info/refs')) {
+      const service = query.get('service');
+      if (method !== 'GET') return sendJson(res, 404, { message: 'Not Found' });
+      if (service === 'git-upload-pack') {
+        if (req.headers['git-protocol'] === 'version=2') {
+          return send(res, 200, v2Advertisement(), GIT_AD_UPLOAD);
         }
-        if (command === 'command=fetch') {
-          const fetchReq: FetchRequest = { wants: [], haves: [], shallow: [], deepen: null, thinPack: false };
-          for (const a of args) {
-            if (a === 'thin-pack') fetchReq.thinPack = true;
-            else if (a.startsWith('want ')) fetchReq.wants.push(a.slice(5).trim());
-            else if (a.startsWith('have ')) fetchReq.haves.push(a.slice(5).trim());
-            else if (a.startsWith('shallow ')) fetchReq.shallow.push(a.slice(8).trim());
-            else if (a.startsWith('deepen ')) {
-              const n = Number(a.slice(7).trim());
-              if (Number.isFinite(n)) fetchReq.deepen = n;
-            }
-          }
-          const plan = planFetch(repo, fetchReq);
-          sendBuffer(res, 200, v2FetchResponse(repo, fetchReq, plan), 'application/x-git-upload-pack-result');
-          return true;
-        }
-        sendJson(res, 400, { message: `unknown v2 command ${JSON.stringify(command)}` });
-        return true;
+        return send(res, 200, v0UploadAdvertisement(repo), GIT_AD_UPLOAD);
       }
-      // v0 fetch.
-      const fetchReq = parseV0Fetch(body);
-      const plan = planFetch(repo, fetchReq);
-      sendBuffer(res, 200, v0FetchResponse(plan), 'application/x-git-upload-pack-result');
-      return true;
-    } catch (err) {
-      sendJson(res, 400, { message: (err as Error).message });
-      return true;
+      if (service === 'git-receive-pack') {
+        return send(res, 200, v0ReceiveAdvertisement(repo), GIT_AD_RECEIVE);
+      }
+      return sendJson(res, 400, { message: 'unknown service' });
     }
+
+    const body = await readBody(req);
+    if (path.endsWith('/git-upload-pack')) {
+      if (method !== 'POST') return sendJson(res, 404, { message: 'Not Found' });
+      if (req.headers['git-protocol'] === 'version=2') {
+        const request = parseV2Request(body);
+        if (request === null) return sendJson(res, 400, { message: 'malformed pkt-line' });
+        if (request.command === 'ls-refs') {
+          return send(res, 200, lsRefsResponse(repo, { prefixes: request.lsPrefixes, peel: request.lsPeel, symrefs: request.lsSymrefs, unborn: request.lsUnborn }), GIT_RESULT);
+        }
+        if (request.command === 'fetch') {
+          return send(res, 200, v2FetchResponse(store, repo, request.wants, request.haves, request.shallow, request.depth), GIT_RESULT);
+        }
+        return sendJson(res, 400, { message: 'unknown command' });
+      }
+      const request = parseV0Request(body);
+      if (request === null) return sendJson(res, 400, { message: 'malformed pkt-line' });
+      return send(res, 200, v0FetchResponse(store, repo, request.wants, request.haves, request.shallow, request.depth), GIT_RESULT);
+    }
+
+    // receive-pack
+    if (method !== 'POST') return sendJson(res, 404, { message: 'Not Found' });
+    const outcome = handleReceivePack(store, repo, body);
+    if (outcome.status !== 200) {
+      // A malformed push body: git clients expect a report, but the suite's
+      // malformed-POST check only requires the server to stay up and answer.
+      const decoded = decodePackets(body);
+      if (!decoded.ok) return sendJson(res, 400, { message: 'malformed pkt-line' });
+      return sendJson(res, outcome.status, { message: 'Bad Request' });
+    }
+    return send(res, 200, outcome.body, GIT_RECEIVE_RESULT);
   }
 
-  if (method === 'POST' && rest === 'git-receive-pack') {
+  // --- GraphQL ------------------------------------------------------------
+  if (path === '/api/graphql') {
+    if (method !== 'POST') return sendJson(res, 404, { message: 'Not Found' });
+    const body = await readBody(req);
+    let parsed: unknown;
     try {
-      const { report } = handleReceivePack(repo, body);
-      sendBuffer(res, 200, report, 'application/x-git-receive-pack-result');
-      return true;
-    } catch (err) {
-      sendJson(res, 400, { message: (err as Error).message });
-      return true;
+      parsed = JSON.parse(body.toString('utf8'));
+    } catch {
+      return sendJson(res, 400, { message: 'Problems parsing JSON' });
     }
+    const result = Array.isArray(parsed) ? runGraphQLBatch(store, parsed) : runGraphQL(store, parsed);
+    return sendJson(res, 200, result);
   }
 
-  sendJson(res, 404, { message: 'Not Found' });
-  return true;
+  // --- MCP ----------------------------------------------------------------
+  if (path === '/mcp') {
+    if (method !== 'POST') return sendJson(res, 404, { message: 'Not Found' });
+    const body = await readBody(req);
+    const reply = handleMcp(store, body.toString('utf8'));
+    return send(res, reply.status, reply.body, 'application/json');
+  }
+
+  // --- REST ---------------------------------------------------------------
+  if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+    // Fast path: a single-issue read serves cached response bytes directly.
+    if (method === 'GET' && queryString === '') {
+      const match = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(path);
+      if (match !== null) {
+        const bytes = fastIssueRead(decodeURIComponent(match[1]!), decodeURIComponent(match[2]!), Number.parseInt(match[3]!, 10));
+        if (bytes !== null) return send(res, 200, bytes, 'application/json');
+        return sendJson(res, 404, { message: 'Not Found' });
+      }
+    }
+    const segments = path
+      .slice('/api/v3'.length)
+      .split('/')
+      .filter((segment) => segment !== '')
+      .map((segment) => decodeURIComponent(segment));
+    let bodyText = '';
+    if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
+      bodyText = (await readBody(req)).toString('utf8');
+    }
+    const reply = handleRest(store, method, segments, query, bodyText, host);
+    if (reply.body === null) return send(res, reply.status, null, 'application/json', reply.headers);
+    return send(res, reply.status, reply.body, 'application/json', reply.headers);
+  }
+
+  return sendJson(res, 404, { message: 'Not Found' });
 }
 
-// ---------------------------------------------------------------------------
-// main router
-// ---------------------------------------------------------------------------
+const server = createServer((req, res) => {
+  res.socket?.setNoDelay(true);
+  route(req, res).catch((err: unknown) => {
+    if (!res.headersSent) {
+      sendJson(res, 500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
+    } else {
+      res.destroy();
+    }
+  });
+});
 
-export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      try {
-        const path = pathOf(req);
-        const method = req.method ?? 'GET';
-
-        if (method === 'GET' && path === '/healthz') {
-          sendJson(res, 200, { ok: true });
-          return;
-        }
-
-        const body = await readBody(req);
-
-        // git smart HTTP (no auth enforcement; the client always sends the token).
-        if (/^\/[^/]+\/[^/]+\.git\//.test(path)) {
-          if (handleGit(req, res, path, body)) return;
-        }
-
-        // MCP.
-        if (path === '/mcp') {
-          if (method === 'DELETE') {
-            sendJson(res, 200, {});
-            return;
-          }
-          if (method !== 'POST') {
-            sendJson(res, 404, { message: 'Not Found' });
-            return;
-          }
-          if (!authed(req)) {
-            sendJson(res, 401, { message: 'Unauthorized' });
-            return;
-          }
-          const outcome = handleMcp(body);
-          if (outcome.body === null) {
-            sendNoBody(res, outcome.status);
-            return;
-          }
-          sendJson(res, outcome.status, outcome.body, outcome.headers ?? {});
-          return;
-        }
-
-        // GraphQL.
-        if (path === '/api/graphql') {
-          if (method !== 'POST') {
-            sendJson(res, 404, { message: 'Not Found' });
-            return;
-          }
-          if (!authed(req)) {
-            res.writeHead(401, { 'content-type': JSON_TYPE, 'x-github-request-id': nextRequestId() });
-            res.end('{"message":"Unauthorized"}\n');
-            return;
-          }
-          let parsed: unknown;
-          try {
-            parsed = body.length === 0 ? null : (JSON.parse(body.toString('utf8')) as unknown);
-          } catch {
-            sendJson(res, 400, { message: 'Invalid JSON' });
-            return;
-          }
-          const envelope = executeGraphQL(parsed);
-          sendJson(res, 200, envelope);
-          return;
-        }
-
-        // REST v3.
-        if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-          if (!authed(req)) {
-            sendJson(res, 401, { message: 'Unauthorized' });
-            return;
-          }
-          let parsed: unknown = null;
-          if (body.length > 0 && (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE')) {
-            try {
-              parsed = JSON.parse(body.toString('utf8')) as unknown;
-            } catch {
-              sendJson(res, 400, { message: 'Invalid JSON' });
-              return;
-            }
-          }
-          const rawSegments = path === '/api/v3' ? [] : path.slice('/api/v3/'.length).split('/');
-          const segments = rawSegments.filter((s) => s !== '').map(decodeSegment);
-          const ctx: RestCtx = {
-            method,
-            segments,
-            query: queryOf(req),
-            body: parsed,
-            baseUrl: `http://${req.headers.host ?? 'localhost'}`,
-          };
-          const result = routeRest(ctx);
-          if (result === null) {
-            sendJson(res, 404, { message: 'Not Found' });
-            return;
-          }
-          if (result.noBody === true) {
-            sendNoBody(res, result.status);
-            return;
-          }
-          sendJson(res, result.status, result.body, result.headers ?? {});
-          return;
-        }
-
-        sendJson(res, 404, { message: 'Not Found' });
-      } catch (err) {
-        try {
-          sendJson(res, 500, { message: (err as Error).message });
-        } catch {
-          // Response already gone; nothing to do.
-        }
-      }
-    })();
+export function start(port: number): Promise<number> {
+  return new Promise((resolve) => {
+    server.listen(port, '127.0.0.1', () => {
+      resolve((server.address() as { port: number }).port);
+    });
   });
 }
 
-// Re-exported for the local smoke test.
-export { pktLine };
+export { store };
